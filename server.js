@@ -144,20 +144,15 @@ app.post('/api/create-draft-order', async (req, res) => {
           ];
 
     // ── Build one Shopify line item per cart item ─────────────────────
-    // Every line item keeps the TRUE customer quantity and a 2-decimal unit
-    // price (total / qty) — so packing slips, factory orders and invoices show
-    // the real item count. Because Shopify caps unit prices at 2 dp, the summed
-    // (unitPrice × qty) can drift a little from the intended whole-rupee cart
-    // total; that gap is reconciled below with one "Rounding Adjustment".
+    // Map each incoming item straight through: the TRUE customer quantity and a
+    // 2-decimal unit price (total / qty), courtesy of buildLineItem(). NO
+    // rounding reconciliation and NO "Rounding Adjustment" line — Shopify
+    // computes the subtotal natively from these raw lines, even if that leaves
+    // sub-rupee decimals.
     let lineItems;
-    let sum = 0;         // Σ (2-dp unitPrice × qty) — what Shopify will actually bill
-    let targetTotal = 0; // Σ whole-rupee item totals — the clean total we want
     try {
       lineItems = rawItems.map(function (it) {
-        const built = buildLineItem(it);
-        sum += Number(built.lineItem.price) * built.lineItem.quantity;
-        targetTotal += Math.round(built.total);
-        return built.lineItem;
+        return buildLineItem(it).lineItem;
       });
     } catch (validationErr) {
       return res.status(400).json({ error: validationErr.message });
@@ -166,57 +161,21 @@ app.post('/api/create-draft-order', async (req, res) => {
       return res.status(400).json({ error: 'No line items to create.' });
     }
 
-    // Snap both sides to whole paise to kill binary-float noise before diffing.
-    sum = Math.round(sum * 100) / 100;
-    targetTotal = Math.round(targetTotal);
-
-    // ── Rounding Adjustment ───────────────────────────────────────────
-    // diff = the sub-rupee gap between the clean whole-rupee target and the
-    // 2-dp line sum. A POSITIVE gap is added back as a tiny "Rounding
-    // Adjustment" line item (Shopify allows positive custom lines). A NEGATIVE
-    // gap can't be a line item (Shopify forbids negative prices), so it is
-    // folded into the order-level discount below. Either way the reconciled
-    // merchandise total lands on an exact whole rupee — zero stray paise.
-    const diff = Math.round((targetTotal - sum) * 100) / 100;
-    let roundingDiscount = 0;
-    if (diff > 0) {
-      lineItems.push({
-        title: 'Rounding Adjustment',
-        quantity: 1,
-        price: diff.toFixed(2),
-        requires_shipping: false,
-        taxable: true,
-        properties: [{ name: 'Note', value: 'Whole-rupee rounding' }],
-      });
-    } else if (diff < 0) {
-      roundingDiscount = Math.abs(diff);
-    }
-
-    // ── Cart-level discount (+ any negative rounding correction) ───────
+    // ── Cart-level discount ───────────────────────────────────────────
     // Draft Orders bypass the native checkout, so the storefront collects the
     // code on the Cart page and forwards the resolved amount (in rupees) as
-    // `totalDiscount`. A draft order supports only ONE order-level
-    // `applied_discount`, so a negative rounding gap (when it occurs) is merged
-    // into the same fixed-amount discount rather than a second discount object.
+    // `totalDiscount`. Re-apply it here as a single order-level fixed-amount
+    // discount.
     const totalDiscount = Number(req.body.totalDiscount);
     const cartDiscount =
       Number.isFinite(totalDiscount) && totalDiscount > 0 ? totalDiscount : 0;
 
     let appliedDiscount;
-    const orderDiscount = Math.round((cartDiscount + roundingDiscount) * 100) / 100;
-    if (orderDiscount > 0) {
-      let description;
-      if (cartDiscount > 0 && roundingDiscount > 0) {
-        description = 'Cart Discount + Rounding Adjustment';
-      } else if (cartDiscount > 0) {
-        description = 'Cart Discount';
-      } else {
-        description = 'Rounding Adjustment';
-      }
+    if (cartDiscount > 0) {
       appliedDiscount = {
-        description: description,
+        description: 'Cart Discount',
         value_type: 'fixed_amount',
-        value: orderDiscount.toFixed(2),
+        value: cartDiscount.toFixed(2),
       };
     }
 
@@ -259,11 +218,9 @@ app.post('/api/create-draft-order', async (req, res) => {
       invoice_url: draft.invoice_url, // direct checkout link for the frontend
       draft_order_id: draft.id,
       line_item_count: lineItems.length,
-      order_total: targetTotal,                 // clean whole-rupee cart total
-      rounding_adjustment: diff,                // +ve → line item · -ve → discount · 0
       cart_discount: cartDiscount,              // forwarded cart-level discount
       applied_discount: appliedDiscount ? Number(appliedDiscount.value) : 0,
-      shopify_subtotal: draft.subtotal_price,   // Shopify's computed subtotal
+      shopify_subtotal: draft.subtotal_price,   // Shopify's natively-computed subtotal
       shopify_total: draft.total_price,         // subtotal − discount + any tax
     });
   } catch (err) {
