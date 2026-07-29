@@ -150,9 +150,18 @@ app.post('/api/create-draft-order', async (req, res) => {
     // computes the subtotal natively from these raw lines, even if that leaves
     // sub-rupee decimals.
     let lineItems;
+    let subtotal = 0;   // merchandise total (sum of line totals) — drives shipping
+    let pincode = '';   // buyer's delivery pincode (repeated on every line item)
     try {
       lineItems = rawItems.map(function (it) {
-        return buildLineItem(it).lineItem;
+        const built = buildLineItem(it);
+        subtotal += built.total;
+        // Pincode is a cart-wide value present on each item — grab the first.
+        if (!pincode) {
+          const p = it.properties && it.properties['Delivery Pincode'];
+          if (p) pincode = String(p).trim();
+        }
+        return built.lineItem;
       });
     } catch (validationErr) {
       return res.status(400).json({ error: validationErr.message });
@@ -179,13 +188,41 @@ app.post('/api/create-draft-order', async (req, res) => {
       };
     }
 
+    // ── Shipping by delivery pincode ──────────────────────────────────
+    // The storefront collects the buyer's pincode on the Finalize page and
+    // forwards it on every line item. Classify it into a zone and bill a
+    // percentage of the merchandise subtotal. Default (incl. empty/unknown) is
+    // PAN India (6%); Delhi NCR (2.5%) and Northern India (4%) are cheaper.
+    let shippingRate = 0.06;
+    let shippingZone = 'PAN India';
+    if (/^(110|121|122|2013|2010)/.test(pincode)) {
+      shippingRate = 0.025;
+      shippingZone = 'Delhi NCR';
+    } else if (/^(12|13|14|15|16|17|18|19|2[0-8]|3[0-4])/.test(pincode)) {
+      shippingRate = 0.04;
+      shippingZone = 'Northern India';
+    }
+    const shippingAmount = subtotal * shippingRate;
+
     const noteParts = [];
     if (body.whatsappNumber) noteParts.push('WhatsApp: ' + body.whatsappNumber);
+    // Anti-cheat: the pincode entered on the Finalize page only ESTIMATES
+    // shipping — flag it so staff verify it against the real address.
+    if (pincode) {
+      noteParts.push(
+        'Customer entered Pincode on Finalize Page: ' + pincode +
+        '. Please verify this matches the final shipping address.'
+      );
+    }
 
     const draftPayload = {
       draft_order: {
         line_items: lineItems,
         applied_discount: appliedDiscount || undefined,
+        shipping_line: {
+          title: 'Shipping (' + shippingZone + ')',
+          price: shippingAmount.toFixed(2),
+        },
         note: noteParts.join(' | ') || undefined,
         tags: 'draft-order-api-test',
       },
@@ -220,8 +257,11 @@ app.post('/api/create-draft-order', async (req, res) => {
       line_item_count: lineItems.length,
       cart_discount: cartDiscount,              // forwarded cart-level discount
       applied_discount: appliedDiscount ? Number(appliedDiscount.value) : 0,
+      pincode: pincode || null,                 // buyer-entered delivery pincode
+      shipping_zone: shippingZone,              // resolved shipping zone
+      shipping_amount: Number(shippingAmount.toFixed(2)), // charged shipping
       shopify_subtotal: draft.subtotal_price,   // Shopify's natively-computed subtotal
-      shopify_total: draft.total_price,         // subtotal − discount + any tax
+      shopify_total: draft.total_price,         // subtotal − discount + shipping + tax
     });
   } catch (err) {
     const status = (err.response && err.response.status) || 500;
