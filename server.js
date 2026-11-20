@@ -242,8 +242,12 @@ const DRAFT_ORDER_MUTATION = [
   '      subtotalPriceSet { shopMoney { amount currencyCode } }',
   '      totalTaxSet { shopMoney { amount currencyCode } }',
   '      totalPriceSet { shopMoney { amount currencyCode } }',
+  // `custom` (Boolean) tells linked vs custom lines and needs only
+  // read_draft_orders. We deliberately AVOID `variant`/`product` here —
+  // those require the read_products scope the checkout token lacks and
+  // return ACCESS_DENIED.
   '      lineItems(first: 50) {',
-  '        edges { node { id title quantity variant { id } product { id title } } }',
+  '        edges { node { id title quantity custom } }',
   '      }',
   '    }',
   '    userErrors { field message }',
@@ -399,13 +403,20 @@ app.post('/api/create-draft-order', async (req, res) => {
     const payload = shopifyRes.data || {};
 
     // Top-level GraphQL errors (bad query, throttling, auth-scope, …).
+    // Surface the actual Shopify message(s) in `error` so the cause is
+    // readable client-side, while keeping the raw array in `detail`.
     if (Array.isArray(payload.errors) && payload.errors.length) {
       console.error(
         '[create-draft-order] GraphQL errors:',
         JSON.stringify(payload.errors).slice(0, 500)
       );
+      const msg =
+        payload.errors
+          .map((e) => e && e.message)
+          .filter(Boolean)
+          .join('; ') || 'Unknown GraphQL error.';
       return res.status(502).json({
-        error: 'Shopify GraphQL error.',
+        error: 'Shopify GraphQL error: ' + msg,
         detail: payload.errors,
       });
     }
@@ -417,8 +428,13 @@ app.post('/api/create-draft-order', async (req, res) => {
         '[create-draft-order] userErrors:',
         JSON.stringify(userErrors).slice(0, 500)
       );
+      const msg =
+        userErrors
+          .map((e) => e && e.message)
+          .filter(Boolean)
+          .join('; ') || 'Draft order rejected.';
       return res.status(400).json({
-        error: 'Draft order rejected by Shopify.',
+        error: 'Draft order rejected by Shopify: ' + msg,
         user_errors: userErrors,
       });
     }
@@ -429,6 +445,19 @@ app.post('/api/create-draft-order', async (req, res) => {
         .status(502)
         .json({ error: 'Shopify did not return an invoice_url.', raw: payload });
     }
+
+    // Linked vs custom lines, read from the returned `custom` flag
+    // (custom === false → linked to a catalog variant; true → custom
+    // line). Falls back to the build-time counters if the selection
+    // returned nothing.
+    const liNodes = (draft.lineItems && draft.lineItems.edges
+      ? draft.lineItems.edges
+      : []
+    )
+      .map((e) => e && e.node)
+      .filter(Boolean);
+    const linkedFromResp = liNodes.filter((n) => n.custom === false).length;
+    const fallbackFromResp = liNodes.filter((n) => n.custom === true).length;
 
     const subtotalAmt =
       draft.subtotalPriceSet && draft.subtotalPriceSet.shopMoney
@@ -463,8 +492,8 @@ app.post('/api/create-draft-order', async (req, res) => {
       shopify_total: totalAmt,
       // ── debug / observability ──
       shopify_tax: taxAmt,
-      items_linked_to_variant: linkedCount,
-      items_fallback_custom: fallbackCount,
+      items_linked_to_variant: liNodes.length ? linkedFromResp : linkedCount,
+      items_fallback_custom: liNodes.length ? fallbackFromResp : fallbackCount,
       api_version: API_VERSION,
     });
   } catch (err) {
