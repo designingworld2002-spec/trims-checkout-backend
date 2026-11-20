@@ -5,15 +5,29 @@
  *    existing storefront "₹1-hack" cart flow. It does not replace or touch it.
  *
  *   POST /api/create-draft-order
- *     body: { title, quantity, price, properties, whatsappNumber, totalDiscount }
- *            — OR multi-item: { items: [{ title, quantity, totalPrice, properties }],
+ *     body: { title, quantity, price, properties, variant_id, whatsappNumber, totalDiscount }
+ *            — OR multi-item: { items: [{ title, quantity, totalPrice, properties, variant_id }],
  *              whatsappNumber, totalDiscount }
  *       - price / totalPrice = TOTAL price per line (server derives unit price)
+ *       - variant_id        = the REAL catalog ProductVariant id (numeric or gid).
+ *         When present, the draft-order line is LINKED to that catalog product
+ *         so Shopify applies its collection tax override (GST 5% vs 18%) and
+ *         shows the real product image at checkout — the whole point of this
+ *         migration. Its catalog price is overridden with our exact price via
+ *         `priceOverride`.
  *       - totalDiscount = OPTIONAL cart-level discount in rupees; applied as an
  *         order-level fixed_amount discount on the draft order
  *       - properties = object { name: value } OR array [{ name, value }]
- *     → creates a Shopify draft order with custom line item(s) priced at
- *       (total / quantity) per unit, and returns { invoice_url }.
+ *     → creates a Shopify draft order (GraphQL `draftOrderCreate`) with the
+ *       custom line item(s) and returns { invoice_url }.
+ *
+ * WHY GraphQL (not REST): the REST Draft Orders endpoint only accepts a
+ * `variant_id` on a line item if you let Shopify use the catalog price — the
+ * moment you pass a custom `price`, REST turns the line into a *custom* item
+ * with NO product link, so every Product/Collection tax override is bypassed
+ * and the order falls back to the default 18% GST. GraphQL's
+ * `DraftOrderLineItemInput` solves this: `variantId` + `priceOverride` keep
+ * the catalog link (correct tax + image) AND our exact price simultaneously.
  *
  * Credentials come from environment variables (.env) — never hardcode a live
  * token in source.  See .env.example.
@@ -33,72 +47,213 @@ app.use(express.json({ limit: '2mb' }));
 
 const SHOPIFY_DOMAIN = process.env.SHOPIFY_DOMAIN || 'YOUR_SHOPIFY_DOMAIN';
 const ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || 'YOUR_ACCESS_TOKEN';
-const API_VERSION = process.env.SHOPIFY_API_VERSION || '2024-01';
 const PORT = process.env.PORT || 3000;
 
+// Presentment + money currency. India store → INR. Set
+// SHOPIFY_PRESENTMENT_CURRENCY='' to OMIT presentmentCurrencyCode entirely
+// (do this only if Shopify rejects it because INR isn't an enabled
+// presentment currency for the shop).
+const CURRENCY = process.env.SHOPIFY_CURRENCY || 'INR';
+const PRESENTMENT_CURRENCY =
+  process.env.SHOPIFY_PRESENTMENT_CURRENCY != null
+    ? process.env.SHOPIFY_PRESENTMENT_CURRENCY.trim()
+    : 'INR';
+
+// ── Admin GraphQL API version ────────────────────────────────────────────
+// `priceOverride` on DraftOrderLineItemInput needs a recent version. We
+// respect SHOPIFY_API_VERSION when it's new enough, but AUTO-UPGRADE a stale
+// value (e.g. the old default 2024-01, which predates priceOverride) to a
+// modern default so the migration can't silently fall back to the broken
+// 18%-GST behaviour.
+const DEFAULT_API_VERSION = '2026-04';
+const MIN_API_VERSION_NUM = 2025 * 100 + 1; // 2025-01
+
+function resolveApiVersion(envVal, fallback) {
+  const v = String(envVal || '').trim();
+  const m = /^(\d{4})-(\d{2})$/.exec(v);
+  if (!m) return fallback;
+  const num = parseInt(m[1], 10) * 100 + parseInt(m[2], 10);
+  if (num < MIN_API_VERSION_NUM) return fallback; // too old for priceOverride
+  return v;
+}
+
+const API_VERSION = resolveApiVersion(
+  process.env.SHOPIFY_API_VERSION,
+  DEFAULT_API_VERSION
+);
+
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
+
 /**
- * Normalise `properties` (an object OR an array) into Shopify's line-item
- * shape: [{ name, value }]. Blank names are dropped.
+ * Normalise `properties` (an object OR an array of {name,value}/{key,value})
+ * into GraphQL `customAttributes`: [{ key, value }]. Blank keys AND
+ * null/empty values are dropped cleanly (a literal "0" is KEPT — only
+ * null / undefined / empty-string are skipped).
  */
-function toLineItemProperties(properties) {
+function toCustomAttributes(properties) {
   if (!properties) return [];
+  let pairs;
   if (Array.isArray(properties)) {
-    return properties
-      .map((p) => ({
-        name: String((p && (p.name != null ? p.name : p.key)) || '').trim(),
-        value: String(p && p.value != null ? p.value : ''),
-      }))
-      .filter((p) => p.name);
+    pairs = properties.map((p) => ({
+      key: String((p && (p.name != null ? p.name : p.key)) || '').trim(),
+      value: p && p.value != null ? p.value : '',
+    }));
+  } else {
+    pairs = Object.keys(properties).map((k) => ({
+      key: String(k).trim(),
+      value: properties[k],
+    }));
   }
-  return Object.keys(properties).map((k) => ({
-    name: String(k),
-    value: String(properties[k] == null ? '' : properties[k]),
-  }));
+  return pairs
+    .map((p) => ({ key: p.key, value: p.value == null ? '' : String(p.value) }))
+    .filter((p) => p.key && p.value !== '');
 }
 
 /**
- * Build ONE Shopify custom line item from a cart item:
- *   { title, quantity, totalPrice (or legacy `price`), properties }
+ * Extract the buyer's Delivery Pincode from an item's properties (object OR
+ * array form), returning '' when absent.
+ */
+function pincodeFromProperties(properties) {
+  if (!properties) return '';
+  if (Array.isArray(properties)) {
+    const hit = properties.find(
+      (p) => p && (p.name === 'Delivery Pincode' || p.key === 'Delivery Pincode')
+    );
+    return hit && hit.value != null ? String(hit.value).trim() : '';
+  }
+  return properties['Delivery Pincode']
+    ? String(properties['Delivery Pincode']).trim()
+    : '';
+}
+
+/**
+ * Normalise a variant id (numeric, numeric-string, or already a gid) into a
+ * ProductVariant gid. Returns null when genuinely absent.
+ */
+function toVariantGid(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (/^gid:\/\/shopify\/ProductVariant\/\d+$/.test(s)) return s;
+  const num = s.replace(/\D/g, '');
+  return num ? 'gid://shopify/ProductVariant/' + num : null;
+}
+
+/**
+ * Decide quantity + per-unit price so the line total is ALWAYS exact.
  *
- * - unit price = totalPrice / quantity, to 2 decimals (Shopify wants a string)
- * - properties object → [{ name, value }]
+ * - Per-unit (preferred): quantity = the real customer quantity and
+ *   unitPrice = total / quantity rounded to 2 dp — used ONLY when that
+ *   reconstructs the total exactly (e.g. ribbons 2 × ₹600 = ₹1,200, or any
+ *   cleanly-divisible run). The real quantity shows on the checkout line.
+ * - Lump-sum (exact fallback): when total/quantity doesn't divide to a clean
+ *   2-dp unit price (e.g. ₹5,426.36 ÷ 2000 = 2.71318, which as 2.71 × 2000
+ *   would LOSE ₹6.36), bill quantity = 1 at the full total so the customer is
+ *   charged the exact amount. The true quantity stays visible in the
+ *   `Actual Quantity` custom attribute. Never loses or invents a paisa.
+ */
+function resolveQtyAndUnit(total, quantity) {
+  const t = Number(Number(total).toFixed(2));
+  const q = parseInt(quantity, 10);
+  if (!Number.isFinite(q) || q <= 1) {
+    return { quantity: 1, unitPrice: t, strategy: 'lump-sum' };
+  }
+  const unit2 = Number((t / q).toFixed(2));
+  if (Math.abs(unit2 * q - t) < 0.005) {
+    return { quantity: q, unitPrice: unit2, strategy: 'per-unit' };
+  }
+  return { quantity: 1, unitPrice: t, strategy: 'lump-sum' };
+}
+
+/**
+ * Build ONE GraphQL DraftOrderLineItemInput from a cart item:
+ *   { title, quantity, totalPrice (or legacy `price`), properties, variant_id }
  *
- * NOTE on the property field: the REST draft_orders endpoint uses `properties`
- * ([{name,value}]). `custom_attributes` ([{key,value}]) is the GraphQL naming
- * and is IGNORED by REST — using it would silently drop every design detail
- * from the order. So we map to `properties`, which is verified to appear on
- * the created draft order.
+ * Primary path (variant_id present): link to the catalog variant and
+ * override its price. Fallback (variant_id missing): a custom line item with
+ * originalUnitPriceWithCurrency — checkout never crashes, but logs a warning
+ * because that line will NOT get the collection tax override.
  */
 function buildLineItem(raw) {
   const title = String((raw && raw.title) || '').trim();
-  const quantity = parseInt(raw && raw.quantity, 10);
-  // Accept `totalPrice` (multi-item cart shape) OR `price` (legacy single item).
+  const rawQty = parseInt(raw && raw.quantity, 10);
   const total = Number(
     raw && (raw.totalPrice != null ? raw.totalPrice : raw.price)
   );
 
-  if (!title) throw new Error('Each item needs a non-empty `title`.');
-  if (!Number.isFinite(quantity) || quantity <= 0) {
+  if (!Number.isFinite(rawQty) || rawQty <= 0) {
     throw new Error('Each item `quantity` must be a positive number.');
   }
   if (!Number.isFinite(total) || total <= 0) {
     throw new Error('Each item `totalPrice` must be a positive number.');
   }
 
-  const unitPrice = (total / quantity).toFixed(2);
-  return {
-    total: total,
-    unitPrice: unitPrice,
-    lineItem: {
+  const variantGid = toVariantGid(
+    raw && (raw.variant_id != null ? raw.variant_id : raw.variantId != null ? raw.variantId : raw.id)
+  );
+  const { quantity, unitPrice, strategy } = resolveQtyAndUnit(total, rawQty);
+  const customAttributes = toCustomAttributes(raw && raw.properties);
+  const amount = unitPrice.toFixed(2);
+
+  let lineItem;
+  if (variantGid) {
+    // PRIMARY — linked to the catalog variant. priceOverride overrides the
+    // catalog price; we deliberately DO NOT pass originalUnitPrice* (ignored
+    // alongside variantId) and DO NOT touch `taxable` (let the variant + its
+    // collection tax override govern GST).
+    lineItem = {
+      variantId: variantGid,
+      quantity: quantity,
+      priceOverride: { amount: amount, currencyCode: CURRENCY },
+      customAttributes: customAttributes,
+    };
+  } else {
+    // FALLBACK — unlinked custom line. No collection tax override will apply.
+    if (!title) throw new Error('A line item without a variant_id needs a non-empty `title`.');
+    console.warn(
+      '[create-draft-order] No variant_id for item "' + title +
+        '" — falling back to a CUSTOM line item. This line will NOT get the ' +
+        'collection tax override (GST may default to 18%). Ensure the cart ' +
+        'interceptor forwards each item\'s variant_id.'
+    );
+    lineItem = {
       title: title,
       quantity: quantity,
-      price: unitPrice, // per-unit price on a custom line item
-      requires_shipping: true,
+      originalUnitPriceWithCurrency: { amount: amount, currencyCode: CURRENCY },
       taxable: true,
-      properties: toLineItemProperties(raw && raw.properties),
-    },
-  };
+      requiresShipping: true,
+      customAttributes: customAttributes,
+    };
+  }
+
+  return { total: total, linked: !!variantGid, strategy: strategy, lineItem: lineItem };
 }
+
+const DRAFT_ORDER_MUTATION = [
+  'mutation CreateDraftOrder($input: DraftOrderInput!) {',
+  '  draftOrderCreate(input: $input) {',
+  '    draftOrder {',
+  '      id',
+  '      legacyResourceId',
+  '      name',
+  '      invoiceUrl',
+  '      subtotalPriceSet { shopMoney { amount currencyCode } }',
+  '      totalTaxSet { shopMoney { amount currencyCode } }',
+  '      totalPriceSet { shopMoney { amount currencyCode } }',
+  '      lineItems(first: 50) {',
+  '        edges { node { id title quantity variant { id } product { id title } } }',
+  '      }',
+  '    }',
+  '    userErrors { field message }',
+  '  }',
+  '}',
+].join('\n');
+
+/* ------------------------------------------------------------------ */
+/* Routes                                                             */
+/* ------------------------------------------------------------------ */
 
 app.get('/health', (req, res) => {
   res.json({
@@ -106,6 +261,7 @@ app.get('/health', (req, res) => {
     service: 'draft-order-backend',
     domain: SHOPIFY_DOMAIN,
     apiVersion: API_VERSION,
+    transport: 'graphql',
     configured:
       SHOPIFY_DOMAIN !== 'YOUR_SHOPIFY_DOMAIN' &&
       ACCESS_TOKEN !== 'YOUR_ACCESS_TOKEN',
@@ -126,10 +282,9 @@ app.post('/api/create-draft-order', async (req, res) => {
       });
     }
 
-    // Accept a MULTI-ITEM cart ({ items: [...] }) — the new Cart Interceptor
-    // flow — OR fall back to the original SINGLE-ITEM shape
-    // ({ title, quantity, price, properties }) so the existing finalize-page
-    // beta button keeps working unchanged.
+    // Accept a MULTI-ITEM cart ({ items: [...] }) — the Cart Interceptor flow
+    // — OR fall back to the original SINGLE-ITEM shape so the existing
+    // finalize-page beta button keeps working unchanged.
     const rawItems =
       Array.isArray(body.items) && body.items.length
         ? body.items
@@ -140,27 +295,23 @@ app.post('/api/create-draft-order', async (req, res) => {
               price: body.price,
               totalPrice: body.totalPrice,
               properties: body.properties,
+              variant_id: body.variant_id,
             },
           ];
 
-    // ── Build one Shopify line item per cart item ─────────────────────
-    // Map each incoming item straight through: the TRUE customer quantity and a
-    // 2-decimal unit price (total / qty), courtesy of buildLineItem(). NO
-    // rounding reconciliation and NO "Rounding Adjustment" line — Shopify
-    // computes the subtotal natively from these raw lines, even if that leaves
-    // sub-rupee decimals.
+    // ── Build one GraphQL line item per cart item ─────────────────────
     let lineItems;
-    let subtotal = 0;   // merchandise total (sum of line totals) — drives shipping
-    let pincode = '';   // buyer's delivery pincode (repeated on every line item)
+    let subtotal = 0; // merchandise total (sum of line totals) — drives shipping
+    let pincode = ''; // buyer's delivery pincode (first one wins)
+    let linkedCount = 0;
+    let fallbackCount = 0;
     try {
       lineItems = rawItems.map(function (it) {
         const built = buildLineItem(it);
         subtotal += built.total;
-        // Pincode is a cart-wide value present on each item — grab the first.
-        if (!pincode) {
-          const p = it.properties && it.properties['Delivery Pincode'];
-          if (p) pincode = String(p).trim();
-        }
+        if (built.linked) linkedCount++;
+        else fallbackCount++;
+        if (!pincode) pincode = pincodeFromProperties(it.properties);
         return built.lineItem;
       });
     } catch (validationErr) {
@@ -171,10 +322,6 @@ app.post('/api/create-draft-order', async (req, res) => {
     }
 
     // ── Cart-level discount ───────────────────────────────────────────
-    // Draft Orders bypass the native checkout, so the storefront collects the
-    // code on the Cart page and forwards the resolved amount (in rupees) as
-    // `totalDiscount`. Re-apply it here as a single order-level fixed-amount
-    // discount.
     const totalDiscount = Number(req.body.totalDiscount);
     const cartDiscount =
       Number.isFinite(totalDiscount) && totalDiscount > 0 ? totalDiscount : 0;
@@ -182,17 +329,20 @@ app.post('/api/create-draft-order', async (req, res) => {
     let appliedDiscount;
     if (cartDiscount > 0) {
       appliedDiscount = {
+        title: 'Cart Discount',
         description: 'Cart Discount',
-        value_type: 'fixed_amount',
-        value: cartDiscount.toFixed(2),
+        value: cartDiscount,
+        valueType: 'FIXED_AMOUNT',
+        amountWithCurrency: {
+          amount: cartDiscount.toFixed(2),
+          currencyCode: CURRENCY,
+        },
       };
     }
 
     // ── Shipping by delivery pincode ──────────────────────────────────
-    // The storefront collects the buyer's pincode on the Finalize page and
-    // forwards it on every line item. Classify it into a zone and bill a
-    // percentage of the merchandise subtotal. Default (incl. empty/unknown) is
-    // PAN India (6%); Delhi NCR (2.5%) and Northern India (4%) are cheaper.
+    // Default (incl. empty/unknown) is PAN India (6%); Delhi NCR (2.5%) and
+    // Northern India (4%) are cheaper. (Unchanged from the REST version.)
     let shippingRate = 0.06;
     let shippingZone = 'PAN India';
     if (/^(110|121|122|2013|2010)/.test(pincode)) {
@@ -204,10 +354,9 @@ app.post('/api/create-draft-order', async (req, res) => {
     }
     const shippingAmount = subtotal * shippingRate;
 
+    // ── Note (anti-cheat pincode verification + WhatsApp) ─────────────
     const noteParts = [];
     if (body.whatsappNumber) noteParts.push('WhatsApp: ' + body.whatsappNumber);
-    // Anti-cheat: the pincode entered on the Finalize page only ESTIMATES
-    // shipping — flag it so staff verify it against the real address.
     if (pincode) {
       noteParts.push(
         'Customer entered Pincode on Finalize Page: ' + pincode +
@@ -215,53 +364,108 @@ app.post('/api/create-draft-order', async (req, res) => {
       );
     }
 
-    const draftPayload = {
-      draft_order: {
-        line_items: lineItems,
-        applied_discount: appliedDiscount || undefined,
-        shipping_line: {
-          title: 'Shipping (' + shippingZone + ')',
-          price: shippingAmount.toFixed(2),
+    // ── Assemble the DraftOrderInput ──────────────────────────────────
+    const input = {
+      lineItems: lineItems,
+      shippingLine: {
+        title: 'Shipping (' + shippingZone + ')',
+        priceWithCurrency: {
+          amount: shippingAmount.toFixed(2),
+          currencyCode: CURRENCY,
         },
-        note: noteParts.join(' | ') || undefined,
-        tags: 'draft-order-api-test',
       },
+      tags: ['draft-order-api-test'],
     };
+    if (appliedDiscount) input.appliedDiscount = appliedDiscount;
+    if (noteParts.length) input.note = noteParts.join(' | ');
+    if (PRESENTMENT_CURRENCY) input.presentmentCurrencyCode = PRESENTMENT_CURRENCY;
 
+    // ── Call the Admin GraphQL API ────────────────────────────────────
     const url =
-      'https://' +
-      SHOPIFY_DOMAIN +
-      '/admin/api/' +
-      API_VERSION +
-      '/draft_orders.json';
+      'https://' + SHOPIFY_DOMAIN + '/admin/api/' + API_VERSION + '/graphql.json';
 
-    const shopifyRes = await axios.post(url, draftPayload, {
-      headers: {
-        'X-Shopify-Access-Token': ACCESS_TOKEN,
-        'Content-Type': 'application/json',
-      },
-      timeout: 20000,
-    });
+    const shopifyRes = await axios.post(
+      url,
+      { query: DRAFT_ORDER_MUTATION, variables: { input: input } },
+      {
+        headers: {
+          'X-Shopify-Access-Token': ACCESS_TOKEN,
+          'Content-Type': 'application/json',
+        },
+        timeout: 20000,
+      }
+    );
 
-    const draft = shopifyRes.data && shopifyRes.data.draft_order;
-    if (!draft || !draft.invoice_url) {
-      return res
-        .status(502)
-        .json({ error: 'Shopify did not return an invoice_url.', raw: shopifyRes.data });
+    const payload = shopifyRes.data || {};
+
+    // Top-level GraphQL errors (bad query, throttling, auth-scope, …).
+    if (Array.isArray(payload.errors) && payload.errors.length) {
+      console.error(
+        '[create-draft-order] GraphQL errors:',
+        JSON.stringify(payload.errors).slice(0, 500)
+      );
+      return res.status(502).json({
+        error: 'Shopify GraphQL error.',
+        detail: payload.errors,
+      });
     }
 
+    const result = payload.data && payload.data.draftOrderCreate;
+    const userErrors = (result && result.userErrors) || [];
+    if (userErrors.length) {
+      console.error(
+        '[create-draft-order] userErrors:',
+        JSON.stringify(userErrors).slice(0, 500)
+      );
+      return res.status(400).json({
+        error: 'Draft order rejected by Shopify.',
+        user_errors: userErrors,
+      });
+    }
+
+    const draft = result && result.draftOrder;
+    if (!draft || !draft.invoiceUrl) {
+      return res
+        .status(502)
+        .json({ error: 'Shopify did not return an invoice_url.', raw: payload });
+    }
+
+    const subtotalAmt =
+      draft.subtotalPriceSet && draft.subtotalPriceSet.shopMoney
+        ? draft.subtotalPriceSet.shopMoney.amount
+        : null;
+    const totalAmt =
+      draft.totalPriceSet && draft.totalPriceSet.shopMoney
+        ? draft.totalPriceSet.shopMoney.amount
+        : null;
+    const taxAmt =
+      draft.totalTaxSet && draft.totalTaxSet.shopMoney
+        ? draft.totalTaxSet.shopMoney.amount
+        : null;
+
+    // ── Response — SAME shape the storefront interceptor already expects ──
+    // (invoice_url + error are all the interceptor reads; the extra keys are
+    // kept from the REST version and a few debug fields are ADDED.)
     return res.json({
       ok: true,
-      invoice_url: draft.invoice_url, // direct checkout link for the frontend
-      draft_order_id: draft.id,
+      invoice_url: draft.invoiceUrl,
+      draft_order_id: draft.legacyResourceId
+        ? Number(draft.legacyResourceId)
+        : draft.id,
+      draft_order_name: draft.name,
       line_item_count: lineItems.length,
-      cart_discount: cartDiscount,              // forwarded cart-level discount
-      applied_discount: appliedDiscount ? Number(appliedDiscount.value) : 0,
-      pincode: pincode || null,                 // buyer-entered delivery pincode
-      shipping_zone: shippingZone,              // resolved shipping zone
-      shipping_amount: Number(shippingAmount.toFixed(2)), // charged shipping
-      shopify_subtotal: draft.subtotal_price,   // Shopify's natively-computed subtotal
-      shopify_total: draft.total_price,         // subtotal − discount + shipping + tax
+      cart_discount: cartDiscount,
+      applied_discount: appliedDiscount ? cartDiscount : 0,
+      pincode: pincode || null,
+      shipping_zone: shippingZone,
+      shipping_amount: Number(shippingAmount.toFixed(2)),
+      shopify_subtotal: subtotalAmt,
+      shopify_total: totalAmt,
+      // ── debug / observability ──
+      shopify_tax: taxAmt,
+      items_linked_to_variant: linkedCount,
+      items_fallback_custom: fallbackCount,
+      api_version: API_VERSION,
     });
   } catch (err) {
     const status = (err.response && err.response.status) || 500;
@@ -271,7 +475,6 @@ app.post('/api/create-draft-order', async (req, res) => {
       status,
       JSON.stringify(detail).slice(0, 500)
     );
-    // Surface auth errors verbatim; everything else is a bad-gateway to Shopify.
     const outStatus = status === 401 || status === 403 ? status : 502;
     return res.status(outStatus).json({
       error: 'Failed to create draft order.',
@@ -283,7 +486,17 @@ app.post('/api/create-draft-order', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log('▶ draft-order-backend on http://localhost:' + PORT);
-  console.log('  Shopify:', SHOPIFY_DOMAIN, '| Admin API', API_VERSION);
+  console.log('  Shopify:', SHOPIFY_DOMAIN, '| Admin GraphQL', API_VERSION);
+  if (
+    String(process.env.SHOPIFY_API_VERSION || '').trim() &&
+    API_VERSION !== String(process.env.SHOPIFY_API_VERSION || '').trim()
+  ) {
+    console.log(
+      '  ⚠ SHOPIFY_API_VERSION=' + process.env.SHOPIFY_API_VERSION +
+        ' is too old for priceOverride — using ' + API_VERSION +
+        ' instead. Update .env to silence this.'
+    );
+  }
   if (
     SHOPIFY_DOMAIN === 'YOUR_SHOPIFY_DOMAIN' ||
     ACCESS_TOKEN === 'YOUR_ACCESS_TOKEN'
